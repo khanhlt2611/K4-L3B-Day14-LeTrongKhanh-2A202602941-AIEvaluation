@@ -25,6 +25,7 @@ The reranking helper is an optional bonus exercise and may remain unimplemented.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -53,12 +54,11 @@ class QAPair:
         retrieved_contexts: List of retrieved chunks (ORDER = retriever rank).
                             Used by the retrieval-side metrics (Task 2b).
     """
-    # TODO: define fields
-    # Hints:
-    #   context: str = ""
-    #   metadata: dict = field(default_factory=dict)
-    #   retrieved_contexts: list = field(default_factory=list)
-    pass
+    question: str
+    expected_answer: str
+    context: str = ""
+    metadata: dict = field(default_factory=dict)
+    retrieved_contexts: list = field(default_factory=list)
 
 
 @dataclass
@@ -89,12 +89,15 @@ class EvalResult:
                         (Both stay None unless retrieved chunks are supplied;
                          they are NOT part of overall_score().)
     """
-    # TODO: define fields
-    # Hints:
-    #   failure_type: str | None = None
-    #   context_precision: float | None = None
-    #   context_recall: float | None = None
-    pass
+    qa_pair: QAPair
+    actual_answer: str
+    faithfulness: float
+    relevance: float
+    completeness: float
+    passed: bool
+    failure_type: str | None = None
+    context_precision: float | None = None
+    context_recall: float | None = None
 
     def overall_score(self) -> float:
         """Compute the average of faithfulness, relevance, and completeness.
@@ -104,7 +107,8 @@ class EvalResult:
 
         TODO: Return mean of the three metric scores
         """
-        raise NotImplementedError
+        return (self.faithfulness + self.relevance + self.completeness) / 3.0
+
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +165,12 @@ class RAGASEvaluator:
         Returns:
             float in [0.0, 1.0] — 1.0 = fully grounded in context.
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_faithfulness")
+        answer_tokens = _tokenize(answer)
+        if not answer_tokens:
+            return 1.0
+
+        score = len(answer_tokens & _tokenize(context)) / len(answer_tokens)
+        return max(0.0, min(1.0, score))
 
     def evaluate_relevance(self, answer: str, question: str) -> float:
         """
@@ -175,8 +183,12 @@ class RAGASEvaluator:
         Returns:
             float in [0.0, 1.0]
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_relevance")
+        question_tokens = _tokenize(question)
+        if not question_tokens:
+            return 1.0
+
+        score = len(_tokenize(answer) & question_tokens) / len(question_tokens)
+        return max(0.0, min(1.0, score))
 
     def evaluate_completeness(self, answer: str, expected: str) -> float:
         """
@@ -189,8 +201,12 @@ class RAGASEvaluator:
         Returns:
             float in [0.0, 1.0]
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_completeness")
+        expected_tokens = _tokenize(expected)
+        if not expected_tokens:
+            return 1.0
+
+        score = len(_tokenize(answer) & expected_tokens) / len(expected_tokens)
+        return max(0.0, min(1.0, score))
 
     # -----------------------------------------------------------------------
     # Task 2b — Retrieval-side metrics (evaluate the GET-CONTEXT step)
@@ -211,8 +227,15 @@ class RAGASEvaluator:
 
         Low recall => retriever missed evidence the answer needs.
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_context_recall")
+        expected_tokens = _tokenize(expected)
+        if not expected_tokens:
+            return 1.0
+
+        union_tokens: set[str] = set()
+        for chunk in contexts:
+            union_tokens.update(_tokenize(chunk))
+
+        return len(expected_tokens & union_tokens) / len(expected_tokens)
 
     def evaluate_context_precision(
         self,
@@ -232,8 +255,23 @@ class RAGASEvaluator:
         Return 1.0 if expected empty; 0.0 if no chunks or none relevant.
         Reordering relevant chunks earlier (reranking) raises this score.
         """
-        # TODO
-        raise NotImplementedError("Implement evaluate_context_precision")
+        expected_tokens = _tokenize(expected)
+        if not expected_tokens:
+            return 1.0
+        if not contexts:
+            return 0.0
+
+        relevant_count = 0
+        precision_sum = 0.0
+        expected_count = len(expected_tokens)
+
+        for rank, chunk in enumerate(contexts, start=1):
+            overlap = len(_tokenize(chunk) & expected_tokens)
+            if overlap / expected_count >= relevance_threshold:
+                relevant_count += 1
+                precision_sum += relevant_count / rank
+
+        return precision_sum / relevant_count if relevant_count else 0.0
 
     def run_full_eval(
         self,
@@ -265,8 +303,48 @@ class RAGASEvaluator:
         Returns:
             EvalResult with all fields populated.
         """
-        # TODO
-        raise NotImplementedError("Implement run_full_eval")
+        faithfulness = self.evaluate_faithfulness(answer, context)
+        relevance = self.evaluate_relevance(answer, question)
+        completeness = self.evaluate_completeness(answer, expected)
+        passed = (
+            faithfulness >= 0.5
+            and relevance >= 0.5
+            and completeness >= 0.5
+        )
+
+        failure_type = None
+        if not passed:
+            if faithfulness < 0.3:
+                failure_type = "hallucination"
+            elif relevance < 0.3:
+                failure_type = "irrelevant"
+            elif completeness < 0.3:
+                failure_type = "incomplete"
+            else:
+                failure_type = "off_topic"
+
+        context_recall = None
+        context_precision = None
+        if contexts is not None:
+            context_recall = self.evaluate_context_recall(contexts, expected)
+            context_precision = self.evaluate_context_precision(contexts, expected)
+
+        return EvalResult(
+            qa_pair=QAPair(
+                question=question,
+                expected_answer=expected,
+                context=context,
+                retrieved_contexts=contexts if contexts is not None else [],
+            ),
+            actual_answer=answer,
+            faithfulness=faithfulness,
+            relevance=relevance,
+            completeness=completeness,
+            passed=passed,
+            failure_type=failure_type,
+            context_precision=context_precision,
+            context_recall=context_recall,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +387,7 @@ class LLMJudge:
     """
 
     def __init__(self, judge_llm_fn: Callable[[str], str]) -> None:
-        # TODO: store judge_llm_fn
-        pass
+        self.judge_llm_fn = judge_llm_fn
 
     def score_response(
         self,
@@ -342,8 +419,31 @@ class LLMJudge:
                 "reasoning": str,               # raw LLM explanation
             }
         """
-        # TODO
-        raise NotImplementedError("Implement score_response")
+        rubric_text = "\n".join(
+            f"- {criterion}: {description}" for criterion, description in rubric.items()
+        )
+        prompt = (
+            "Evaluate the answer against each rubric criterion. Return only a JSON "
+            "object mapping every criterion name to a score from 0 to 1.\n\n"
+            f"Question:\n{question}\n\nAnswer:\n{answer}\n\nRubric:\n{rubric_text}"
+        )
+        response = self.judge_llm_fn(prompt)
+        default_scores = {criterion: 0.5 for criterion in rubric}
+
+        try:
+            start = response.index("{")
+            parsed, _ = json.JSONDecoder().raw_decode(response[start:])
+            if isinstance(parsed.get("scores"), dict):
+                parsed = parsed["scores"]
+            scores = {
+                criterion: float(parsed[criterion]) for criterion in rubric
+            }
+            if any(not 0.0 <= score <= 1.0 for score in scores.values()):
+                raise ValueError("Scores must be between 0 and 1")
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            scores = default_scores
+
+        return {"scores": scores, "reasoning": response}
 
     def detect_bias(self, scores_batch: list[dict[str, Any]]) -> dict[str, Any]:
         """
@@ -364,8 +464,33 @@ class LLMJudge:
                 "severity_bias":   bool,
             }
         """
-        # TODO
-        raise NotImplementedError("Implement detect_bias")
+        response_averages: list[float] = []
+        total = 0.0
+        count = 0
+
+        for result in scores_batch:
+            scores = result.get("scores", {})
+            if not scores:
+                continue
+
+            values = scores.values()
+            score_sum = sum(values)
+            score_count = len(scores)
+            response_averages.append(score_sum / score_count)
+            total += score_sum
+            count += score_count
+
+        average = total / count if count else 0.0
+        positional_bias = (
+            len(response_averages) > 1
+            and all(response_averages[0] > score for score in response_averages[1:])
+        )
+
+        return {
+            "positional_bias": positional_bias,
+            "leniency_bias": count > 0 and average > 0.8,
+            "severity_bias": count > 0 and average < 0.3,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -400,10 +525,18 @@ class BenchmarkRunner:
         Returns:
             List of EvalResult, one per qa_pair.
         """
-        # TODO: for each pair, call agent_fn(pair.question), then run_full_eval.
-        # Pass pair.retrieved_contexts as the optional contexts argument and
-        # preserve the original pair on the returned EvalResult.
-        raise NotImplementedError("Implement BenchmarkRunner.run")
+        results = []
+        for pair in qa_pairs:
+            result = evaluator.run_full_eval(
+                agent_fn(pair.question),
+                pair.question,
+                pair.context,
+                pair.expected_answer,
+                pair.retrieved_contexts,
+            )
+            result.qa_pair = pair
+            results.append(result)
+        return results
 
     def generate_report(self, results: list[EvalResult]) -> dict[str, Any]:
         """
@@ -425,8 +558,51 @@ class BenchmarkRunner:
         Average only non-None retrieval scores. Return None for a retrieval
         average when no result contains that metric.
         """
-        # TODO
-        raise NotImplementedError("Implement generate_report")
+        total = len(results)
+        passed = 0
+        faithfulness_sum = 0.0
+        relevance_sum = 0.0
+        completeness_sum = 0.0
+        context_recall_sum = 0.0
+        context_recall_count = 0
+        context_precision_sum = 0.0
+        context_precision_count = 0
+        failure_types: dict[str, int] = {}
+
+        for result in results:
+            passed += result.passed
+            faithfulness_sum += result.faithfulness
+            relevance_sum += result.relevance
+            completeness_sum += result.completeness
+
+            if result.context_recall is not None:
+                context_recall_sum += result.context_recall
+                context_recall_count += 1
+            if result.context_precision is not None:
+                context_precision_sum += result.context_precision
+                context_precision_count += 1
+            if result.failure_type is not None:
+                failure_types[result.failure_type] = failure_types.get(result.failure_type, 0) + 1
+
+        return {
+            "total": total,
+            "passed": passed,
+            "pass_rate": passed / total if total else 0.0,
+            "avg_faithfulness": faithfulness_sum / total if total else 0.0,
+            "avg_relevance": relevance_sum / total if total else 0.0,
+            "avg_completeness": completeness_sum / total if total else 0.0,
+            "avg_context_recall": (
+                context_recall_sum / context_recall_count
+                if context_recall_count
+                else None
+            ),
+            "avg_context_precision": (
+                context_precision_sum / context_precision_count
+                if context_precision_count
+                else None
+            ),
+            "failure_types": failure_types,
+        }
 
     def run_regression(self, new_results: list, baseline_results: list) -> dict:
         """Compare new evaluation results against a baseline.
@@ -450,7 +626,34 @@ class BenchmarkRunner:
 
         TODO: Compute avg per metric, compare, list regressions, set passed flag
         """
-        raise NotImplementedError
+        metric_names = ("faithfulness", "relevance", "completeness")
+
+        def average(results: list[EvalResult], metric: str) -> float:
+            if not results:
+                return 0.0
+            return sum(getattr(result, metric) for result in results) / len(results)
+
+        new_averages = {metric: average(new_results, metric) for metric in metric_names}
+        baseline_averages = {
+            metric: average(baseline_results, metric) for metric in metric_names
+        }
+        regressions = [
+            metric
+            for metric in metric_names
+            if baseline_averages[metric] - new_averages[metric] > 0.05
+        ]
+        report: dict[str, Any] = {
+            f"new_avg_{metric}": new_averages[metric] for metric in metric_names
+        }
+        report.update(
+            {
+                f"baseline_avg_{metric}": baseline_averages[metric]
+                for metric in metric_names
+            }
+        )
+        report["regressions"] = regressions
+        report["passed"] = not regressions
+        return report
 
     def identify_failures(
         self,
@@ -467,8 +670,12 @@ class BenchmarkRunner:
         Returns:
             List of failing EvalResults.
         """
-        # TODO
-        raise NotImplementedError("Implement identify_failures")
+        return [
+            result
+            for result in results
+            if min(result.faithfulness, result.relevance, result.completeness)
+            < threshold
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -502,8 +709,11 @@ class FailureAnalyzer:
             dict mapping failure_type → count.
             Example: {"hallucination": 3, "irrelevant": 2, "incomplete": 5}
         """
-        # TODO
-        raise NotImplementedError("Implement categorize_failures")
+        categories: dict[str, int] = {}
+        for failure in failures:
+            failure_type = failure.failure_type or "unknown"
+            categories[failure_type] = categories.get(failure_type, 0) + 1
+        return categories
 
     def find_root_cause(self, failure: EvalResult) -> str:
         """
@@ -515,8 +725,24 @@ class FailureAnalyzer:
             "Answer is missing key information — increase context window or improve generation"
             "Multiple issues detected — review full pipeline"
         """
-        # TODO: compare faithfulness, relevance, completeness, return appropriate string
-        raise NotImplementedError("Implement find_root_cause")
+        scores = {
+            "faithfulness": failure.faithfulness,
+            "relevance": failure.relevance,
+            "completeness": failure.completeness,
+        }
+        lowest = min(scores.values())
+        lowest_metrics = [metric for metric, score in scores.items() if score == lowest]
+        if len(lowest_metrics) != 1:
+            return "Multiple issues detected — review full pipeline"
+        causes = {
+            "faithfulness": "Context is missing or irrelevant — improve retrieval",
+            "relevance": "Answer does not address the question — improve prompt clarity",
+            "completeness": (
+                "Answer is missing key information — increase context window "
+                "or improve generation"
+            ),
+        }
+        return causes[lowest_metrics[0]]
 
     def generate_improvement_log(self, failures: list, suggestions: list[str]) -> str:
         """Generate a Markdown table logging failures and improvement actions.
@@ -535,7 +761,28 @@ class FailureAnalyzer:
 
         TODO: Build markdown table with failure details + matched suggestions
         """
-        raise NotImplementedError
+        def escape(value: Any) -> str:
+            return str(value).replace("|", "\\|").replace("\n", " ")
+
+        lines = [
+            "| Failure ID | Type | Root Cause | Suggested Fix | Status |",
+            "|------------|------|------------|---------------|--------|",
+        ]
+        for index, failure in enumerate(failures, start=1):
+            metadata = failure.qa_pair.metadata or {}
+            failure_id = metadata.get("id") or f"F{index:03d}"
+            failure_type = failure.failure_type or "unknown"
+            suggestion = (
+                suggestions[index - 1]
+                if index <= len(suggestions)
+                else "Review the full trace and add this case to the regression set"
+            )
+            lines.append(
+                f"| {escape(failure_id)} | {escape(failure_type)} | "
+                f"{escape(self.find_root_cause(failure))} | "
+                f"{escape(suggestion)} | Open |"
+            )
+        return "\n".join(lines)
 
     def generate_improvement_suggestions(
         self, failures: list[EvalResult]
@@ -553,8 +800,62 @@ class FailureAnalyzer:
         Returns:
             List of at least 3 suggestion strings (or fewer if failures is empty).
         """
-        # TODO: analyze categorized failures and return suggestions
-        raise NotImplementedError("Implement generate_improvement_suggestions")
+        if not failures:
+            return []
+
+        normalized_counts: dict[str, int] = {}
+        for failure_type, count in self.categorize_failures(failures).items():
+            key = failure_type.casefold()
+            normalized_counts[key] = normalized_counts.get(key, 0) + count
+        actions = {
+            "hallucination": (
+                "Add grounding checks and require every factual claim to be "
+                "supported by retrieved context"
+            ),
+            "irrelevant": (
+                "Clarify the answer prompt and add intent-focused examples to "
+                "keep responses on topic"
+            ),
+            "incomplete": (
+                "Increase useful context coverage and prompt the generator to "
+                "include every required policy condition"
+            ),
+            "low_completeness": (
+                "Increase useful context coverage and prompt the generator to "
+                "include every required policy condition"
+            ),
+            "off_topic": (
+                "Add intent classification and explicit out-of-scope handling "
+                "before answer generation"
+            ),
+            "refusal": (
+                "Calibrate guardrails with allowed customer-support examples to "
+                "reduce unnecessary refusals"
+            ),
+            "unknown": (
+                "Inspect retrieval and generation traces, then label the failure "
+                "before changing the pipeline"
+            ),
+        }
+        prioritized_types = sorted(
+            normalized_counts,
+            key=lambda item: (-normalized_counts[item], item),
+        )
+        suggestions = [
+            actions.get(failure_type, actions["unknown"])
+            for failure_type in prioritized_types
+        ]
+        fallback_actions = [
+            "Add the failed cases to a permanent regression benchmark",
+            "Tune retrieval chunking and ranking using context recall and precision",
+            "Review low-scoring answers with a human-calibrated evaluation rubric",
+        ]
+        for action in fallback_actions:
+            if len(suggestions) >= 3:
+                break
+            if action not in suggestions:
+                suggestions.append(action)
+        return suggestions
 
 
 # ---------------------------------------------------------------------------

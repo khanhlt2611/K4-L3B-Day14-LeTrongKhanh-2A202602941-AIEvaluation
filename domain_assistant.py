@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import OpenAI, OpenAIError, RateLimitError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -35,6 +35,8 @@ STOPWORD_TEXT = (
 )
 STOPWORDS = frozenset(STOPWORD_TEXT.split())
 SOURCE_REPEAT_DECAY = 0.9
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+SUPPORTED_LLM_PROVIDERS = frozenset({"openai", "gemini"})
 ProgressCallback = Callable[[str], None]
 
 
@@ -243,26 +245,77 @@ class TextGenerator(Protocol):
 
 
 class OpenAIGenerator:
+    """Generate text through OpenAI or Gemini's OpenAI-compatible endpoint."""
+
     def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
+        self.provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+        if self.provider not in SUPPORTED_LLM_PROVIDERS:
+            supported = ", ".join(sorted(SUPPORTED_LLM_PROVIDERS))
+            raise RuntimeError(
+                f"LLM_PROVIDER must be one of: {supported}; found {self.provider!r}"
+            )
+
+        if self.provider == "gemini":
+            key_name = "GEMINI_API_KEY"
+            model_name = "GEMINI_MODEL"
+            base_url = GEMINI_OPENAI_BASE_URL
+        else:
+            key_name = "OPENAI_API_KEY"
+            model_name = "OPENAI_MODEL"
+            base_url = None
+
+        api_key = os.getenv(key_name, "").strip()
+        self.model = os.getenv(model_name, "").strip()
+        if not api_key or api_key.startswith("your_"):
+            raise RuntimeError(f"{key_name} is missing or still a placeholder in .env")
         if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+            raise RuntimeError(f"{model_name} is missing from .env")
+        client_options: dict[str, Any] = {"api_key": api_key}
+        if base_url is not None:
+            client_options["base_url"] = base_url
+        self.client = OpenAI(**client_options)
         self.max_output_tokens = max_output_tokens
+        self._last_request_started_at: float | None = None
+
+    def _wait_for_gemini_quota(self) -> None:
+        """Keep free-tier Gemini traffic below five requests per minute."""
+        if self.provider != "gemini" or self._last_request_started_at is None:
+            return
+        elapsed = time.monotonic() - self._last_request_started_at
+        if elapsed < 13.0:
+            time.sleep(13.0 - elapsed)
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
+        if self.provider == "gemini":
+            answer = ""
+            for attempt in range(3):
+                self._wait_for_gemini_quota()
+                self._last_request_started_at = time.monotonic()
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        max_tokens=self.max_output_tokens,
+                    )
+                except RateLimitError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(15.0 * (attempt + 1))
+                    continue
+                answer = (response.choices[0].message.content or "").strip()
+                if answer:
+                    break
+        else:
+            response = self.client.responses.create(
+                model=self.model,
+                input=prompt,
+                temperature=0,
+                max_output_tokens=self.max_output_tokens,
+            )
+            answer = response.output_text.strip()
         if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
+            raise RuntimeError(f"{self.provider.title()} returned an empty answer")
         return answer
 
 
